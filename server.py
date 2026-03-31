@@ -5,11 +5,37 @@ import threading
 # Centralized, in-memory storage structure 
 indexed_logs = []
 # Lock to ensure safe reading/writing when you add concurrency later [cite: 14, 85]
-rw_lock = threading.Lock()
+rw_lock = threading.RLock()
 
 # Basic regex to extract Timestamp, Hostname, Process, Severity, Message 
 # Note: Real syslog regexes can get complex; this is a simplified version for the prototype.
 LOG_PATTERN = re.compile(r"^(?P<timestamp>[a-zA-Z]{3}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+(?P<hostname>\S+)\s+(?P<process>\S+?)(?:\[\d+\])?:\s*(?:(?P<severity>ERROR|WARN|INFO|DEBUG)\s*:?\s*)?(?P<message>.*)$")
+
+def send_message(sock, message: str):
+    encoded = message.encode('utf-8')
+    header = f"{len(encoded):010d}|".encode('utf-8')
+    sock.sendall(header + encoded)
+ 
+def recv_message(sock) -> str:
+    # Step 1: Read exactly 11 bytes (10-digit length + '|')
+    header_data = b""
+    while len(header_data) < 11:
+        chunk = sock.recv(11 - len(header_data))
+        if not chunk:
+            raise ConnectionError("Connection closed during header read")
+        header_data += chunk
+ 
+    msg_len = int(header_data[:10])
+ 
+    # Step 2: Read exactly msg_len bytes for the body
+    body = b""
+    while len(body) < msg_len:
+        chunk = sock.recv(min(4096, msg_len - len(body)))
+        if not chunk:
+            raise ConnectionError("Connection closed during body read")
+        body += chunk
+ 
+    return body.decode('utf-8')
 
 def parse_and_store(log_data):
     global indexed_logs
@@ -53,56 +79,60 @@ def handle_query(command, value):
         return "\n".join(output)
 
 def start_server():
-    global indexed_logs
     host = '127.0.0.1'
     port = 65432
-
+ 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Avoid "Address already in use" on restart
     server_socket.bind((host, port))
     server_socket.listen(1)
-    print(f"Server listening on {host}:{port}")
-
+    print(f"[Server] Listening on {host}:{port}")
+ 
     conn, addr = server_socket.accept()
-    print(f"Connected by {addr}")
-
+    print(f"[Server] Connected by {addr}")
+ 
     while True:
         try:
-            # Note: 4096 might be too small for massive files; we'll keep it simple for now
-            data = conn.recv(40960).decode('utf-8') 
+            data = recv_message(conn)
             if not data:
                 break
-
+ 
             parts = data.split('|', 2)
             action = parts[0]
-
+ 
             if action == "UPLOAD":
                 filesize = int(parts[1])
                 file_content = parts[2]
                 count = parse_and_store(file_content)
-                conn.sendall(f"SUCCESS: File received and {count} syslog entries parsed and indexed.".encode('utf-8'))
-
+                send_message(conn, f"SUCCESS: File received and {count} syslog entries parsed and indexed.")
+ 
             elif action == "QUERY":
                 sub_command = parts[1]
                 query_value = parts[2]
                 response = handle_query(sub_command, query_value)
-                conn.sendall(response.encode('utf-8'))
-
+                send_message(conn, response)
+ 
             elif action == "ADMIN":
                 admin_cmd = parts[1]
                 if admin_cmd == "PURGE":
-                    with rw_lock: # Acquire exclusive write lock [cite: 85]
+                    with rw_lock:
+                        count = len(indexed_logs)
                         indexed_logs.clear()
-                    conn.sendall("SUCCESS: All indexed log entries have been erased.".encode('utf-8'))
+                    send_message(conn, f"SUCCESS: {count} indexed log entries have been erased.")
                 elif admin_cmd == "QUIT":
-                    print("Client requested termination.")
+                    print("[Server] Client requested disconnection.")
                     break
-
-        except Exception as e:
-            print(f"Error: {e}")
+ 
+        except ConnectionError as e:
+            print(f"[Server] Connection lost: {e}")
             break
-
+        except Exception as e:
+            print(f"[Server] Error: {e}")
+            break
+ 
     conn.close()
     server_socket.close()
-
+    print("[Server] Shut down.")
+ 
 if __name__ == "__main__":
     start_server()

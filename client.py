@@ -19,6 +19,34 @@ HELP                               : Displays this menu.
 =============================================================================
 """)
 
+def send_message(client_socket, message):
+    encoded = message.encode('utf-8')
+    length = len(encoded)
+    # Prepend the length as a fixed 10-digit ASCII number, e.g. "0000000512|<body>"
+    header = f"{length:010d}|".encode('utf-8')
+    client_socket.sendall(header + encoded)
+
+def recv_message(client_socket) -> str:
+    # Step 1: Read exactly 11 bytes to get the length header
+    header = b""
+    while len(header) < 11:
+        chunk = client_socket.recv(11 - len(header))
+        if not chunk:
+            raise ConnectionError("Socket closed before header complete")
+        header += chunk
+    
+    msg_len = int(header[:10].strip())
+    
+    # Step 2: Read exactly msg_len bytes for the body
+    body = b""
+    while len(body) < msg_len:
+        chunk = client_socket.recv(msg_len - len(body))
+        if not chunk:
+            raise ConnectionError("Socket closed before body complete")
+        body += chunk
+    
+    return body.decode('utf-8')
+
 def start_client():
     host = '127.0.0.1'
     port = 65432
@@ -55,9 +83,11 @@ def start_client():
                         content = f.read()
                     filesize = len(content)
                     protocol_string = f"UPLOAD|{filesize}|{content}"
-                    client_socket.sendall(protocol_string.encode('utf-8'))
+                    # old
+                    #client_socket.sendall(protocol_string.encode('utf-8'))
+                    send_message(client_socket, protocol_string) # Use the new send_message function
                     print(f"[System Message] Uploading syslog ({filesize} bytes)...")
-                    response = client_socket.recv(4096).decode('utf-8')
+                    response = recv_message(client_socket)
                     print(f"[Server Response] {response}")
                 except FileNotFoundError:
                     print(f"File not found: {file_path}")
@@ -70,21 +100,21 @@ def start_client():
                 value = command_input[2].strip('"') # Remove quotes if user typed them
                 
                 protocol_string = f"QUERY|{search_type}|{value}"
-                client_socket.sendall(protocol_string.encode('utf-8'))
+                send_message(client_socket, protocol_string)
                 print("[System Message] Sending query...")
-                response = client_socket.recv(4096).decode('utf-8')
+                response = recv_message(client_socket)
                 print(f"[Server Response] {response}")
 
             elif base_cmd == "PURGE":
                 protocol_string = "ADMIN|PURGE"
-                client_socket.sendall(protocol_string.encode('utf-8'))
+                send_message(client_socket, protocol_string)
                 print(f"[System Message] Connecting to {host}:{port} to purge records... [cite: 88]")
-                response = client_socket.recv(4096).decode('utf-8')
+                response = recv_message(client_socket)
                 print(f"[Server Response] {response}")
 
             elif base_cmd == "QUIT":
                 protocol_string = "ADMIN|QUIT"
-                client_socket.sendall(protocol_string.encode('utf-8'))
+                send_message(client_socket, protocol_string)
                 print("Closing connection.")
                 break
             
