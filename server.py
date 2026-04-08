@@ -6,7 +6,7 @@ import threading
 # Centralized, in-memory storage structure
 indexed_logs = []
 # RLock allows the same thread to acquire the lock multiple times (reentrant)
-rw_lock = threading.RLock()
+r_lock = threading.RLock()
 
 # Syslog regex: captures Timestamp, Hostname, Process, and Message.
 # Notes:
@@ -73,7 +73,7 @@ def parse_and_store(log_data: str) -> int:
     """Parse raw syslog text and store structured entries. Returns count of parsed lines."""
     global indexed_logs
     count = 0
-    with rw_lock:
+    with r_lock:
         for line in log_data.splitlines():
             if not line.strip():
                 continue
@@ -88,7 +88,7 @@ def parse_and_store(log_data: str) -> int:
 
 def handle_query(command: str, value: str) -> str:
     """Execute a search/count query against the indexed logs and return a formatted response."""
-    with rw_lock:
+    with r_lock:
         if command == "COUNT_KEYWORD":
             count = sum(1 for log in indexed_logs if value.lower() in log['message'].lower())
             return f"The keyword '{value}' appears in {count} indexed log entry/entries."
@@ -172,7 +172,7 @@ def handle_client(conn, addr):
             elif action == "ADMIN":
                 admin_cmd = parts[1]
                 if admin_cmd == "PURGE":
-                    with rw_lock:
+                    with r_lock:
                         count = len(indexed_logs)
                         indexed_logs.clear()
                     send_message(conn, f"SUCCESS: {count} indexed log entries have been erased.")
@@ -192,8 +192,8 @@ def handle_client(conn, addr):
         print(f"[Server] Connection closed for {addr}")
 
 
-def start_server(port: int):
-    host = 'localhost'  # Listen on all interfaces so remote clients can connect
+def start_server(port: int, host: int):
+    #host = 'localhost'  # Listen on all interfaces so remote clients can connect
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -213,15 +213,20 @@ def start_server(port: int):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python server.py <port>")
-        print("Example: python server.py 65432")
+    if len(sys.argv) != 3:
+        print("Usage: python server.py <ip_address> <port>")
+        print("Example: python server.py 127.0.0.1 65432")
         sys.exit(1)
 
+    
     try:
-        server_port = int(sys.argv[1])
+        ip = sys.argv[1]
+        server_port = int(sys.argv[2])
     except ValueError:
-        print(f"[Error] Invalid port '{sys.argv[1]}'. Must be an integer.")
+        print(f"[Error] Invalid IP address '{sys.argv[1]}'. Must be an integer.")
+        print(f"[Error] Invalid port '{sys.argv[2]}'. Must be an integer.")
         sys.exit(1)
 
-    start_server(server_port)
+    start_server(server_port, ip)
+
+    

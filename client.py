@@ -90,22 +90,14 @@ def start_client():
             parts = user_input.split(" ", 3)
             base_cmd = parts[0].upper()
 
-            # ------------------------------------------------------------------
-            # HELP — local only, no network
-            # ------------------------------------------------------------------
+
             if base_cmd == "HELP":
                 print_help()
 
-            # ------------------------------------------------------------------
-            # QUIT — local only
-            # ------------------------------------------------------------------
             elif base_cmd == "QUIT":
                 print("[System Message] Exiting.")
                 break
 
-            # ------------------------------------------------------------------
-            # INGEST <file_path> <IP>:<Port>
-            # ------------------------------------------------------------------
             elif base_cmd == "INGEST":
                 # parts: ['INGEST', '<file_path>', '<IP>:<Port>']
                 if len(parts) < 3:
@@ -135,9 +127,6 @@ def start_client():
                 except FileNotFoundError:
                     print(f"[Error] File not found: {file_path}")
 
-            # ------------------------------------------------------------------
-            # QUERY <IP>:<Port> <SEARCH_TYPE> <value>
-            # ------------------------------------------------------------------
             elif base_cmd == "QUERY":
                 # parts: ['QUERY', '<IP>:<Port>', '<SEARCH_TYPE>', '<value>']
                 if len(parts) < 4:
@@ -173,9 +162,7 @@ def start_client():
                 response = do_request(host, port, protocol_string)
                 print(f"[Server Response] {response}")
 
-            # ------------------------------------------------------------------
-            # PURGE <IP>:<Port>
-            # ------------------------------------------------------------------
+
             elif base_cmd == "PURGE":
                 # parts: ['PURGE', '<IP>:<Port>']
                 if len(parts) < 2:
