@@ -1,5 +1,6 @@
 import socket
 import re
+import sys
 import threading
 
 # Centralized, in-memory storage structure
@@ -8,27 +9,37 @@ indexed_logs = []
 rw_lock = threading.RLock()
 
 # Syslog regex: captures Timestamp, Hostname, Process, and Message.
-# Severity is NOT reliably embedded in the syslog header — it is inferred from the message body.
+# Notes:
+#   - \s+ in timestamp handles both "Feb  8" (2 spaces, single-digit day) and "Feb 22" (1 space)
+#   - process uses [^\s\[:/]+ (greedy, stops at space/bracket/colon) so it correctly
+#     captures the full daemon name on lines both with and without a PID bracket:
+#       "sshd[1234]:" -> process="sshd"
+#       "sshd:"       -> process="sshd"  (non-greedy \S+? only grabbed "s" here before)
 LOG_PATTERN = re.compile(
     r"^(?P<timestamp>[a-zA-Z]{3}\s+\d+\s+\d{2}:\d{2}:\d{2})\s+"
     r"(?P<hostname>\S+)\s+"
-    r"(?P<process>\S+?)(?:\[\d+\])?:\s*"
+    r"(?P<process>[^\s\[:/]+)(?:\[\d+\])?:\s*"
     r"(?P<message>.*)$"
 )
 
-# Severity keywords to scan for inside the message body
-SEVERITY_LEVELS = ["EMERGENCY", "ALERT", "CRITICAL", "ERROR", "WARN", "WARNING", "NOTICE", "INFO", "DEBUG"]
+SEVERITY_LEVELS = ["ERROR", "WARN", "WARNING", "INFO", "DEBUG"]
+ 
+# Pre-compiled pattern: matches "error:", "warn:", "warning:", "info:", "debug:"
+# at a word boundary, case-insensitive. WARNING is normalised to WARN on return.
+_SEVERITY_PATTERN = re.compile(
+    r'\b(ERROR|WARN(?:ING)?|INFO|DEBUG)\s*:', re.IGNORECASE
+)
+
 
 def infer_severity(message: str) -> str | None:
-    """Scan the message text for a known severity keyword and return it (uppercased), or None."""
-    msg_upper = message.upper()
-    for level in SEVERITY_LEVELS:
-        # Match whole-word severity tokens to avoid false positives (e.g. "information")
-        if re.search(rf'\b{level}\b', msg_upper):
-            # Normalize WARN/WARNING and CRITICAL aliases
-            if level == "WARNING":
-                return "WARN"
-            return level
+    """
+    Scan the message for a severity tag in the form 'LEVEL:' (e.g. 'error:').
+    Returns the normalised level string (ERROR/WARN/INFO/DEBUG) or None if not found.
+    """
+    match = _SEVERITY_PATTERN.search(message)
+    if match:
+        level = match.group(1).upper()
+        return level
     return None
 
 
@@ -39,7 +50,6 @@ def send_message(sock, message: str):
 
 
 def recv_message(sock) -> str:
-    # Step 1: Read exactly 11 bytes (10-digit length + '|')
     header_data = b""
     while len(header_data) < 11:
         chunk = sock.recv(11 - len(header_data))
@@ -49,7 +59,6 @@ def recv_message(sock) -> str:
 
     msg_len = int(header_data[:10])
 
-    # Step 2: Read exactly msg_len bytes for the body
     body = b""
     while len(body) < msg_len:
         chunk = sock.recv(min(4096, msg_len - len(body)))
@@ -71,7 +80,6 @@ def parse_and_store(log_data: str) -> int:
             match = LOG_PATTERN.match(line)
             if match:
                 entry = match.groupdict()
-                # FIX: Severity is inferred from the message body, not the header
                 entry['severity'] = infer_severity(entry['message'])
                 indexed_logs.append(entry)
                 count += 1
@@ -81,7 +89,6 @@ def parse_and_store(log_data: str) -> int:
 def handle_query(command: str, value: str) -> str:
     """Execute a search/count query against the indexed logs and return a formatted response."""
     with rw_lock:
-        # COUNT_KEYWORD: return aggregate count, not individual lines
         if command == "COUNT_KEYWORD":
             count = sum(1 for log in indexed_logs if value.lower() in log['message'].lower())
             return f"The keyword '{value}' appears in {count} indexed log entry/entries."
@@ -89,17 +96,17 @@ def handle_query(command: str, value: str) -> str:
         results = []
         for log in indexed_logs:
             if command == "SEARCH_DATE":
-                # FIX: Strip extra whitespace in timestamp before comparison
-                if log['timestamp'].strip().startswith(value.strip()):
-                    results.append(log)
+                if log['timestamp'].startswith(value):
+                    rest = log['timestamp'][len(value):]
+                    if rest == "" or rest[0] == " ":
+                        results.append(log)
             elif command == "SEARCH_HOST":
                 if log['hostname'].lower() == value.lower():
                     results.append(log)
             elif command == "SEARCH_DAEMON":
-                if value.lower() in log['process'].lower():
+                if log['process'] == value:
                     results.append(log)
             elif command == "SEARCH_SEVERITY":
-                # FIX: log['severity'] may be None; guard against that before comparing
                 log_sev = log['severity']
                 if log_sev is not None and log_sev.upper() == value.upper():
                     results.append(log)
@@ -109,13 +116,27 @@ def handle_query(command: str, value: str) -> str:
 
         if not results:
             return f"No matching entries found for '{value}'."
-
-        output = [f"Found {len(results)} matching entries for '{value}':"]
-        for i, log in enumerate(results, 1):
+ 
+        total = len(results)
+        DISPLAY_LIMIT  = 50
+        TRUNCATE_AFTER = 300
+ 
+        display = results[:DISPLAY_LIMIT] if total > TRUNCATE_AFTER else results
+ 
+        output = [f"Found {total} matching entries for '{value}':"]
+        for i, log in enumerate(display, 1):
             sev = f"[{log['severity']}] " if log['severity'] else ""
             output.append(
                 f"{i}. {log['timestamp']} {log['hostname']} {log['process']}: {sev}{log['message']}"
             )
+ 
+        if total > TRUNCATE_AFTER:
+            hidden = total - DISPLAY_LIMIT
+            output.append(
+                f"\n... showing {DISPLAY_LIMIT} of {total} results. "
+                f"{hidden} more entries not shown."
+            )
+ 
         return "\n".join(output)
 
 
@@ -133,7 +154,7 @@ def handle_client(conn, addr):
 
             if action == "UPLOAD":
                 if len(parts) < 3:
-                    send_message(conn, "ERROR: Malformed UPLOAD request.")
+                    send_message(conn, "ERROR: Malformed INGEST request.")
                     continue
                 file_content = parts[2]
                 count = parse_and_store(file_content)
@@ -162,8 +183,8 @@ def handle_client(conn, addr):
             else:
                 send_message(conn, f"ERROR: Unknown action '{action}'.")
 
-    except ConnectionError as e:
-        print(f"[Server] Connection lost ({addr}): {e}")
+    except ConnectionError:
+        print(f"[Server] Client {addr} disconnected.")
     except Exception as e:
         print(f"[Server] Error handling client {addr}: {e}")
     finally:
@@ -171,9 +192,8 @@ def handle_client(conn, addr):
         print(f"[Server] Connection closed for {addr}")
 
 
-def start_server():
-    host = '127.0.0.1'
-    port = 65432
+def start_server(port: int):
+    host = 'localhost'  # Listen on all interfaces so remote clients can connect
 
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -181,7 +201,6 @@ def start_server():
     server_socket.listen(5)
     print(f"[Server] Listening on {host}:{port}")
 
-    # FIX: Loop to accept multiple clients (each in their own thread)
     try:
         while True:
             conn, addr = server_socket.accept()
@@ -194,4 +213,15 @@ def start_server():
 
 
 if __name__ == "__main__":
-    start_server()
+    if len(sys.argv) < 2:
+        print("Usage: python server.py <port>")
+        print("Example: python server.py 65432")
+        sys.exit(1)
+
+    try:
+        server_port = int(sys.argv[1])
+    except ValueError:
+        print(f"[Error] Invalid port '{sys.argv[1]}'. Must be an integer.")
+        sys.exit(1)
+
+    start_server(server_port)
